@@ -4,4 +4,4 @@ deep_ls/__pycache__/
 deep_ls/metrics/__pycache__/
 networks/__pycache__/
 polyaxonfile.yaml
-
+.idea/

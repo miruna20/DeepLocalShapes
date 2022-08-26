@@ -247,47 +247,6 @@ def append_parameter_magnitudes(param_mag_log, model):
         if name not in param_mag_log.keys():
             param_mag_log[name] = []
         param_mag_log[name].append(param.data.norm().item())
-def trainer_sequential(center_point, sdf_tree, sdf_grid_radius, lat_vecs, sdf_data, indices, cube_size, decoder, loss_l1, do_code_regularization, code_reg_lambda, epoch,latent_size):
-    inner_sum = 0.0
-    # Get all indices of the samples that are within the L-radius around the cell center.
-    near_sample_indices = sdf_tree.query_ball_point(x=[center_point[1]], r=sdf_grid_radius, p=np.inf)
-
-    # Get number of samples located within the L-radius around the cell center
-    num_sdf_samples = len(near_sample_indices[0])
-    if num_sdf_samples < 1:
-        return
-
-    # Extract code from lat_vecs
-    code = lat_vecs((center_point[0] + indices[0].to(device) * (cube_size ** 3)).long()).to(device)
-
-    # Get groundtruth sdf value
-    sdf_gt = sdf_data[near_sample_indices[0], 3].unsqueeze(1)
-    sdf_gt = torch.tanh(sdf_gt)
-
-    transformed_sample = sdf_data[near_sample_indices[0], :3] - center_point[1]
-    transformed_sample.requires_grad = False
-
-    # TODO where does this 256 come from?
-    code = code.expand(1, latent_size)
-    code = code.repeat(transformed_sample.shape[0], 1)
-
-    decoder_input = torch.cat([code, transformed_sample.to(device)], dim=1).float().to(device)
-
-    # Get network prediction of current sample
-    pred_sdf = decoder(decoder_input)
-
-    # f_theta - s_j
-    inner_sum = loss_l1(pred_sdf.squeeze(0), sdf_gt.to(device)) / num_sdf_samples
-
-    # Right most part of formula (4) in DeepLS ->  + 1/sigma^2 L2(z_i)
-    if do_code_regularization and num_sdf_samples != 0:
-        l2_size_loss = torch.sum(torch.norm(code, dim=0))
-
-        reg_loss = (code_reg_lambda * min(1.0, epoch / 100) * l2_size_loss) / num_sdf_samples
-
-        inner_sum = inner_sum.to(device) + reg_loss.to(device)
-    inner_sum.backward()
-    return inner_sum
 
 def trainer(center_point, sdf_tree, sdf_grid_radius, lat_vecs, sdf_data, indices, cube_size, outer_sum, outer_lock, decoder, loss_l1, do_code_regularization, code_reg_lambda, epoch,latent_size):
     inner_sum = 0.0
@@ -334,26 +293,23 @@ def trainer(center_point, sdf_tree, sdf_grid_radius, lat_vecs, sdf_data, indices
         outer_sum.value += inner_sum.item()
         return
 
-def main_function(experiment_directory, output_directory,continue_from, batch_split, cluster=False):
+
+def main_function(experiment_directory, output_directory, continue_from, batch_split, cluster=False):
     logging.debug("running " + experiment_directory)
 
     specs = ws.load_experiment_specifications(experiment_directory)
 
     logging.info("Experiment description: \n" + str(specs["Description"]))
-    print("Experiment description: " + str(specs["Description"]))
-    print("Output directory: " + str(output_directory))
 
     if (cluster):
         from polyaxon_client.tracking import Experiment, get_data_paths, get_outputs_path
+
         data_paths_polyaxon = get_data_paths()
         logging.debug("Data path polyaxon: {}".format(data_paths_polyaxon))
 
         data_source = os.path.join(data_paths_polyaxon['data1'], "USShapeCompletion", specs["DataSource"])
     else:
         data_source = specs["DataSource"]
-
-    logging.debug("Datasource: {}".format(data_source))
-
     train_split_file = specs["TrainSplit"]
 
     arch = __import__("networks." + specs["NetworkArch"], fromlist=["Decoder"])
@@ -391,7 +347,6 @@ def main_function(experiment_directory, output_directory,continue_from, batch_sp
         save_model(output_directory, str(epoch) + ".pth", decoder, epoch)
         save_optimizer(output_directory, str(epoch) + ".pth", optimizer_all, epoch)
         save_latent_vectors(output_directory, str(epoch) + ".pth", lat_vecs, epoch)
-
     def signal_handler(sig, frame):
         logging.info("Stopping early...")
         sys.exit(0)
@@ -458,13 +413,11 @@ def main_function(experiment_directory, output_directory,continue_from, batch_sp
     logging.info("There are {} scenes".format(num_scenes))
 
     logging.debug(decoder)
-    logging.debug("After this it crashes?")
+
     # TODO check if there is something better than Embedding to store codes.
     # TODO Not sure if max_norm=code_bound is necessary
-    # TODO this lat_vecs is huge. Rewrite so that we get one set of latent vectors per shape and not store
-    # for all shapes in one
     # lat_vecs_size is num_scences times the grid (cube_size^3)
-    lat_vec_size = num_scenes * (cube_size**3)
+    lat_vec_size = num_scenes * (cube_size ** 3)
     lat_vecs = torch.nn.Embedding(lat_vec_size, latent_size, max_norm=code_bound).to(device)
     torch.nn.init.normal_(
         lat_vecs.weight.data,
@@ -566,20 +519,18 @@ def main_function(experiment_directory, output_directory,continue_from, batch_sp
         scene_avg_loss = 0.0
         len_data_loader = len(sdf_loader)
 
-        logging.info("Total number of scenes: {} ".format(len_data_loader))
-
         for sdf_data, indices in sdf_loader:
             current_scene += 1
-            logging.info("Scene: {}/{}".format(current_scene, len_data_loader))
+            # logging.info("Scene: {}/{}".format(current_scene, len_data_loader))
             # sdf_data contains the KDTree of the current scene and all the points in that scene
             # indices is the index of the npz file -> the scene.
             sdf_data = sdf_data.reshape(-1, 4)
-            
+
             sdf_data.requires_grad = False
-        
-            xyz = sdf_data[:,:3]
+
+            xyz = sdf_data[:, :3]
             num_sdf_samples_total = sdf_data.shape[0]
-            logging.info("Num SDF samples: {}".format(num_sdf_samples_total))
+
             # TODO check leaf_size impact on speed. default = 40
             # Default metric of kdtree is L2 norm, Paper uses L infinity -> chebyshev
             sdf_tree = cKDTree(xyz)
@@ -588,29 +539,9 @@ def main_function(experiment_directory, output_directory,continue_from, batch_sp
 
             optimizer_all.zero_grad()
 
-            for center_point in enumerate(sdf_grid_indices):
-                inner_sum = trainer_sequential(center_point=center_point,
-                                sdf_tree = sdf_tree,
-                                sdf_grid_radius = sdf_grid_radius,
-                                lat_vecs = lat_vecs,
-                                sdf_data = sdf_data,
-                                indices = indices,
-                                cube_size = cube_size,
-                                decoder = decoder,
-                                loss_l1 = loss_l1,
-                                do_code_regularization = do_code_regularization,
-                                code_reg_lambda = code_reg_lambda,
-                                epoch = epoch,
-                                latent_size=latent_size)
-                if(not inner_sum==None):
-                    outer_sum += inner_sum.item()
-
-            """
-               if __name__ == '__main__':
+            if __name__ == '__main__':
                 # Shared value counter and lock
                 mp.set_start_method('spawn', force=True)
-                print("spawned")
-
                 manager = mp.Manager()
                 outer_sum = manager.Value('f', 0)
                 outer_lock = manager.Lock()
@@ -621,44 +552,34 @@ def main_function(experiment_directory, output_directory,continue_from, batch_sp
 
                 # Apply map on array of center points
                 res = pool.map(functools.partial(trainer,
-                                sdf_tree = sdf_tree,
-                                sdf_grid_radius = sdf_grid_radius,
-                                lat_vecs = lat_vecs,
-                                sdf_data = sdf_data,
-                                indices = indices,
-                                cube_size = cube_size,
-                                outer_sum = outer_sum,
-                                outer_lock = outer_lock,
-                                decoder = decoder,
-                                loss_l1 = loss_l1,
-                                do_code_regularization = do_code_regularization,
-                                code_reg_lambda = code_reg_lambda,
-                                epoch = epoch
-                                latent_size=latent_size),
-                                enumerate(sdf_grid_indices))
+                                                 sdf_tree=sdf_tree,
+                                                 sdf_grid_radius=sdf_grid_radius,
+                                                 lat_vecs=lat_vecs,
+                                                 sdf_data=sdf_data,
+                                                 indices=indices,
+                                                 cube_size=cube_size,
+                                                 outer_sum=outer_sum,
+                                                 outer_lock=outer_lock,
+                                                 decoder=decoder,
+                                                 loss_l1=loss_l1,
+                                                 do_code_regularization=do_code_regularization,
+                                                 code_reg_lambda=code_reg_lambda,
+                                                 epoch=epoch),
+                               enumerate(sdf_grid_indices))
 
                 pool.close()
                 pool.join()
 
                 logging.info("Multiprocessing Time {}".format(time.time() - start))
-                scene_avg_loss += outer_sum.value
-                logging.info("Scene {} loss = {}".format(current_scene, outer_sum))
-                wandb.log({"outer_sum_loss (per scene)":outer_sum})
 
-                loss_log.append(outer_sum.value)
-
-
-            """
-
-            scene_avg_loss += outer_sum
+            scene_avg_loss += outer_sum.value
             logging.info("Scene {} loss = {}".format(current_scene, outer_sum))
-            wandb.log({"outer_sum_loss (per scene)": outer_sum})
 
-            loss_log.append(outer_sum)
+            loss_log.append(outer_sum.value)
 
             optimizer_all.step()
-                    
-        logging.info("Epoch scene average loss: {}".format((scene_avg_loss/current_scene)))
+
+        logging.info("Epoch scene average loss: {}".format((scene_avg_loss / current_scene)))
         end = time.time()
         seconds_elapsed = end - start
         timing_log.append(seconds_elapsed)
