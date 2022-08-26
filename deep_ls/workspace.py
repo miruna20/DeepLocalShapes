@@ -20,6 +20,7 @@ sdf_samples_subdir = "SdfSamples"
 surface_samples_subdir = "SurfaceSamples"
 normalization_param_subdir = "NormalizationParameters"
 training_meshes_subdir = "TrainingMeshes"
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 def load_experiment_specifications(experiment_directory):
@@ -59,7 +60,7 @@ def build_decoder(experiment_directory, experiment_specs):
 
     latent_size = experiment_specs["CodeLength"]
 
-    decoder = arch.Decoder(latent_size, **experiment_specs["NetworkSpecs"]).cuda()
+    decoder = arch.Decoder(latent_size, **experiment_specs["NetworkSpecs"]).to(device)
 
     return decoder
 
@@ -98,7 +99,7 @@ def load_latent_vectors(experiment_directory, checkpoint):
 
         lat_vecs = []
         for i in range(num_vecs):
-            lat_vecs.append(data["latent_codes"][i].cuda())
+            lat_vecs.append(data["latent_codes"][i].to(device))
 
         return lat_vecs
 

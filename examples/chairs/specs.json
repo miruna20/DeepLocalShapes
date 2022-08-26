@@ -16,7 +16,7 @@
     "latent_dropout" : false,
     "weight_norm" : true
     },
-  "CodeLength" : 256,
+  "CodeLength" : 128,
   "NumEpochs" : 2001,
   "SnapshotFrequency" : 1000,
   "AdditionalSnapshots" : [ 100, 500 ],
@@ -34,8 +34,8 @@
       "Factor" : 0.5
     }],
   "SamplesPerScene" : 16384,
-  "ScenesPerBatch" : 64,
-  "DataLoaderThreads" : 16,
+  "ScenesPerBatch" : 1,
+  "DataLoaderThreads" : 6,
   "ClampingDistance" : 0.1,
   "CodeRegularization" : true,
   "CodeRegularizationLambda" : 1e-4,

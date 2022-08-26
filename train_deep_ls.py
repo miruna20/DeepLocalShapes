@@ -19,6 +19,9 @@ import torch.multiprocessing as mp
 import torch.utils.data as data_utils
 from scipy.spatial import cKDTree
 import numpy as np
+import wandb
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 if not sys.warnoptions:
     warnings.simplefilter("ignore")
@@ -94,8 +97,8 @@ def get_learning_rate_schedules(specs):
     return schedules
 
 
-def save_model(experiment_directory, filename, decoder, epoch):
-    model_params_dir = ws.get_model_params_dir(experiment_directory, True)
+def save_model(output_directory, filename, decoder, epoch):
+    model_params_dir = ws.get_model_params_dir(output_directory, True)
 
     torch.save(
         {"epoch": epoch, "model_state_dict": decoder.state_dict()},
@@ -103,8 +106,8 @@ def save_model(experiment_directory, filename, decoder, epoch):
     )
 
 
-def save_optimizer(experiment_directory, filename, optimizer, epoch):
-    optimizer_params_dir = ws.get_optimizer_params_dir(experiment_directory, True)
+def save_optimizer(output_directory, filename, optimizer, epoch):
+    optimizer_params_dir = ws.get_optimizer_params_dir(output_directory, True)
 
     torch.save(
         {"epoch": epoch, "optimizer_state_dict": optimizer.state_dict()},
@@ -129,8 +132,8 @@ def load_optimizer(experiment_directory, filename, optimizer):
     return data["epoch"]
 
 
-def save_latent_vectors(experiment_directory, filename, latent_vec, epoch):
-    latent_codes_dir = ws.get_latent_codes_dir(experiment_directory, True)
+def save_latent_vectors(output_directory, filename, latent_vec, epoch):
+    latent_codes_dir = ws.get_latent_codes_dir(output_directory, True)
 
     all_latents = latent_vec.state_dict()
 
@@ -174,7 +177,7 @@ def load_latent_vectors(experiment_directory, filename, lat_vecs):
 
 
 def save_logs(
-        experiment_directory,
+        output_directory,
         loss_log,
         lr_log,
         timing_log,
@@ -191,7 +194,7 @@ def save_logs(
             "latent_magnitude": lat_mag_log,
             "param_magnitude": param_mag_log,
         },
-        os.path.join(experiment_directory, ws.logs_filename),
+        os.path.join(output_directory, ws.logs_filename),
     )
 
 
@@ -244,11 +247,50 @@ def append_parameter_magnitudes(param_mag_log, model):
         if name not in param_mag_log.keys():
             param_mag_log[name] = []
         param_mag_log[name].append(param.data.norm().item())
-
-
-def trainer(center_point, sdf_tree, sdf_grid_radius, lat_vecs, sdf_data, indices, cube_size, outer_sum, outer_lock, decoder, loss_l1, do_code_regularization, code_reg_lambda, epoch):
+def trainer_sequential(center_point, sdf_tree, sdf_grid_radius, lat_vecs, sdf_data, indices, cube_size, decoder, loss_l1, do_code_regularization, code_reg_lambda, epoch,latent_size):
     inner_sum = 0.0
-    
+    # Get all indices of the samples that are within the L-radius around the cell center.
+    near_sample_indices = sdf_tree.query_ball_point(x=[center_point[1]], r=sdf_grid_radius, p=np.inf)
+
+    # Get number of samples located within the L-radius around the cell center
+    num_sdf_samples = len(near_sample_indices[0])
+    if num_sdf_samples < 1:
+        return
+
+    # Extract code from lat_vecs
+    code = lat_vecs((center_point[0] + indices[0].to(device) * (cube_size ** 3)).long()).to(device)
+
+    # Get groundtruth sdf value
+    sdf_gt = sdf_data[near_sample_indices[0], 3].unsqueeze(1)
+    sdf_gt = torch.tanh(sdf_gt)
+
+    transformed_sample = sdf_data[near_sample_indices[0], :3] - center_point[1]
+    transformed_sample.requires_grad = False
+
+    # TODO where does this 256 come from?
+    code = code.expand(1, latent_size)
+    code = code.repeat(transformed_sample.shape[0], 1)
+
+    decoder_input = torch.cat([code, transformed_sample.to(device)], dim=1).float().to(device)
+
+    # Get network prediction of current sample
+    pred_sdf = decoder(decoder_input)
+
+    # f_theta - s_j
+    inner_sum = loss_l1(pred_sdf.squeeze(0), sdf_gt.to(device)) / num_sdf_samples
+
+    # Right most part of formula (4) in DeepLS ->  + 1/sigma^2 L2(z_i)
+    if do_code_regularization and num_sdf_samples != 0:
+        l2_size_loss = torch.sum(torch.norm(code, dim=0))
+
+        reg_loss = (code_reg_lambda * min(1.0, epoch / 100) * l2_size_loss) / num_sdf_samples
+
+        inner_sum = inner_sum.to(device) + reg_loss.to(device)
+    inner_sum.backward()
+    return inner_sum
+
+def trainer(center_point, sdf_tree, sdf_grid_radius, lat_vecs, sdf_data, indices, cube_size, outer_sum, outer_lock, decoder, loss_l1, do_code_regularization, code_reg_lambda, epoch,latent_size):
+    inner_sum = 0.0
     # Get all indices of the samples that are within the L-radius around the cell center.
     near_sample_indices = sdf_tree.query_ball_point(x=[center_point[1]], r=sdf_grid_radius, p=np.inf) 
     
@@ -258,7 +300,7 @@ def trainer(center_point, sdf_tree, sdf_grid_radius, lat_vecs, sdf_data, indices
        return
     
     # Extract code from lat_vecs
-    code = lat_vecs((center_point[0] + indices[0].cuda() * (cube_size**3)).long()).cuda()
+    code = lat_vecs((center_point[0] + indices[0].to(device) * (cube_size**3)).long()).to(device)
     
     # Get groundtruth sdf value
     sdf_gt = sdf_data[near_sample_indices[0], 3].unsqueeze(1)
@@ -267,16 +309,16 @@ def trainer(center_point, sdf_tree, sdf_grid_radius, lat_vecs, sdf_data, indices
     transformed_sample = sdf_data[near_sample_indices[0], :3] - center_point[1]
     transformed_sample.requires_grad = False
     
-    code = code.expand(1, 125)
+    code = code.expand(1, latent_size)
     code = code.repeat(transformed_sample.shape[0], 1)
     
-    decoder_input = torch.cat([code, transformed_sample.cuda()], dim=1).float().cuda()
+    decoder_input = torch.cat([code, transformed_sample.to(device)], dim=1).float().to(device)
     
     # Get network prediction of current sample
     pred_sdf = decoder(decoder_input) 
     
     # f_theta - s_j
-    inner_sum = loss_l1(pred_sdf.squeeze(0), sdf_gt.cuda()) / num_sdf_samples
+    inner_sum = loss_l1(pred_sdf.squeeze(0), sdf_gt.to(device)) / num_sdf_samples
 
     # Right most part of formula (4) in DeepLS ->  + 1/sigma^2 L2(z_i)
     if do_code_regularization and num_sdf_samples != 0:
@@ -284,7 +326,7 @@ def trainer(center_point, sdf_tree, sdf_grid_radius, lat_vecs, sdf_data, indices
 
         reg_loss = (code_reg_lambda * min(1.0, epoch / 100) * l2_size_loss) / num_sdf_samples
 
-        inner_sum = inner_sum.cuda() + reg_loss.cuda()
+        inner_sum = inner_sum.to(device)+ reg_loss.to(device)
 
     inner_sum.backward()
 
@@ -292,14 +334,26 @@ def trainer(center_point, sdf_tree, sdf_grid_radius, lat_vecs, sdf_data, indices
         outer_sum.value += inner_sum.item()
         return
 
-def main_function(experiment_directory, continue_from, batch_split):
+def main_function(experiment_directory, output_directory,continue_from, batch_split, cluster=False):
     logging.debug("running " + experiment_directory)
 
     specs = ws.load_experiment_specifications(experiment_directory)
 
     logging.info("Experiment description: \n" + str(specs["Description"]))
+    print("Experiment description: " + str(specs["Description"]))
+    print("Output directory: " + str(output_directory))
 
-    data_source = specs["DataSource"]
+    if (cluster):
+        from polyaxon_client.tracking import Experiment, get_data_paths, get_outputs_path
+        data_paths_polyaxon = get_data_paths()
+        logging.debug("Data path polyaxon: {}".format(data_paths_polyaxon))
+
+        data_source = os.path.join(data_paths_polyaxon['data1'], "USShapeCompletion", specs["DataSource"])
+    else:
+        data_source = specs["DataSource"]
+
+    logging.debug("Datasource: {}".format(data_source))
+
     train_split_file = specs["TrainSplit"]
 
     arch = __import__("networks." + specs["NetworkArch"], fromlist=["Decoder"])
@@ -328,15 +382,15 @@ def main_function(experiment_directory, continue_from, batch_split):
 
     def save_latest(epoch):
 
-        save_model(experiment_directory, "latest.pth", decoder, epoch)
-        save_optimizer(experiment_directory, "latest.pth", optimizer_all, epoch)
-        save_latent_vectors(experiment_directory, "latest.pth", lat_vecs, epoch)
+        save_model(output_directory, "latest.pth", decoder, epoch)
+        save_optimizer(output_directory, "latest.pth", optimizer_all, epoch)
+        save_latent_vectors(output_directory, "latest.pth", lat_vecs, epoch)
 
     def save_checkpoints(epoch):
 
-        save_model(experiment_directory, str(epoch) + ".pth", decoder, epoch)
-        save_optimizer(experiment_directory, str(epoch) + ".pth", optimizer_all, epoch)
-        save_latent_vectors(experiment_directory, str(epoch) + ".pth", lat_vecs, epoch)
+        save_model(output_directory, str(epoch) + ".pth", decoder, epoch)
+        save_optimizer(output_directory, str(epoch) + ".pth", optimizer_all, epoch)
+        save_latent_vectors(output_directory, str(epoch) + ".pth", lat_vecs, epoch)
 
     def signal_handler(sig, frame):
         logging.info("Stopping early...")
@@ -363,7 +417,7 @@ def main_function(experiment_directory, continue_from, batch_split):
 
     voxel_radius = get_spec_with_default(specs, "VoxelRadius", 1.5)
 
-    decoder = arch.Decoder(latent_size, **specs["NetworkSpecs"]).cuda()
+    decoder = arch.Decoder(latent_size, **specs["NetworkSpecs"]).to(device)
 
     logging.info("training with {} GPU(s)".format(torch.cuda.device_count()))
 
@@ -404,12 +458,14 @@ def main_function(experiment_directory, continue_from, batch_split):
     logging.info("There are {} scenes".format(num_scenes))
 
     logging.debug(decoder)
-
+    logging.debug("After this it crashes?")
     # TODO check if there is something better than Embedding to store codes.
     # TODO Not sure if max_norm=code_bound is necessary
+    # TODO this lat_vecs is huge. Rewrite so that we get one set of latent vectors per shape and not store
+    # for all shapes in one
     # lat_vecs_size is num_scences times the grid (cube_size^3)
     lat_vec_size = num_scenes * (cube_size**3)
-    lat_vecs = torch.nn.Embedding(lat_vec_size, latent_size, max_norm=code_bound).cuda()
+    lat_vecs = torch.nn.Embedding(lat_vec_size, latent_size, max_norm=code_bound).to(device)
     torch.nn.init.normal_(
         lat_vecs.weight.data,
         0.0,
@@ -422,7 +478,7 @@ def main_function(experiment_directory, continue_from, batch_split):
         )
     )
 
-    loss_l1 = torch.nn.L1Loss(reduction="sum").cuda()
+    loss_l1 = torch.nn.L1Loss(reduction="sum").to(device)
 
     optimizer_all = torch.optim.Adam(
         [
@@ -510,10 +566,11 @@ def main_function(experiment_directory, continue_from, batch_split):
         scene_avg_loss = 0.0
         len_data_loader = len(sdf_loader)
 
+        logging.info("Total number of scenes: {} ".format(len_data_loader))
 
         for sdf_data, indices in sdf_loader:
             current_scene += 1
-            #logging.info("Scene: {}/{}".format(current_scene, len_data_loader))
+            logging.info("Scene: {}/{}".format(current_scene, len_data_loader))
             # sdf_data contains the KDTree of the current scene and all the points in that scene
             # indices is the index of the npz file -> the scene.
             sdf_data = sdf_data.reshape(-1, 4)
@@ -522,7 +579,7 @@ def main_function(experiment_directory, continue_from, batch_split):
         
             xyz = sdf_data[:,:3]
             num_sdf_samples_total = sdf_data.shape[0]
-
+            logging.info("Num SDF samples: {}".format(num_sdf_samples_total))
             # TODO check leaf_size impact on speed. default = 40
             # Default metric of kdtree is L2 norm, Paper uses L infinity -> chebyshev
             sdf_tree = cKDTree(xyz)
@@ -530,44 +587,74 @@ def main_function(experiment_directory, continue_from, batch_split):
             outer_sum = 0.0
 
             optimizer_all.zero_grad()
-              
-            if __name__ == '__main__': 
+
+            for center_point in enumerate(sdf_grid_indices):
+                inner_sum = trainer_sequential(center_point=center_point,
+                                sdf_tree = sdf_tree,
+                                sdf_grid_radius = sdf_grid_radius,
+                                lat_vecs = lat_vecs,
+                                sdf_data = sdf_data,
+                                indices = indices,
+                                cube_size = cube_size,
+                                decoder = decoder,
+                                loss_l1 = loss_l1,
+                                do_code_regularization = do_code_regularization,
+                                code_reg_lambda = code_reg_lambda,
+                                epoch = epoch,
+                                latent_size=latent_size)
+                if(not inner_sum==None):
+                    outer_sum += inner_sum.item()
+
+            """
+               if __name__ == '__main__':
                 # Shared value counter and lock
                 mp.set_start_method('spawn', force=True)
+                print("spawned")
+
                 manager = mp.Manager()
                 outer_sum = manager.Value('f', 0)
                 outer_lock = manager.Lock()
-                
+
                 # Create Pool for multiprocessing
                 start = time.time()
                 pool = mp.Pool()
 
                 # Apply map on array of center points
-                res = pool.map(functools.partial(trainer, 
-                                sdf_tree = sdf_tree, 
+                res = pool.map(functools.partial(trainer,
+                                sdf_tree = sdf_tree,
                                 sdf_grid_radius = sdf_grid_radius,
-                                lat_vecs = lat_vecs, 
-                                sdf_data = sdf_data, 
-                                indices = indices, 
-                                cube_size = cube_size, 
-                                outer_sum = outer_sum, 
-                                outer_lock = outer_lock, 
-                                decoder = decoder, 
-                                loss_l1 = loss_l1, 
-                                do_code_regularization = do_code_regularization, 
-                                code_reg_lambda = code_reg_lambda, 
-                                epoch = epoch), 
+                                lat_vecs = lat_vecs,
+                                sdf_data = sdf_data,
+                                indices = indices,
+                                cube_size = cube_size,
+                                outer_sum = outer_sum,
+                                outer_lock = outer_lock,
+                                decoder = decoder,
+                                loss_l1 = loss_l1,
+                                do_code_regularization = do_code_regularization,
+                                code_reg_lambda = code_reg_lambda,
+                                epoch = epoch
+                                latent_size=latent_size),
                                 enumerate(sdf_grid_indices))
 
                 pool.close()
                 pool.join()
 
                 logging.info("Multiprocessing Time {}".format(time.time() - start))
+                scene_avg_loss += outer_sum.value
+                logging.info("Scene {} loss = {}".format(current_scene, outer_sum))
+                wandb.log({"outer_sum_loss (per scene)":outer_sum})
 
-            scene_avg_loss += outer_sum.value
+                loss_log.append(outer_sum.value)
+
+
+            """
+
+            scene_avg_loss += outer_sum
             logging.info("Scene {} loss = {}".format(current_scene, outer_sum))
+            wandb.log({"outer_sum_loss (per scene)": outer_sum})
 
-            loss_log.append(outer_sum.value)
+            loss_log.append(outer_sum)
 
             optimizer_all.step()
                     
@@ -589,7 +676,7 @@ def main_function(experiment_directory, continue_from, batch_split):
         if epoch % log_frequency == 0:
             save_latest(epoch)
             save_logs(
-                experiment_directory,
+                output_directory,
                 loss_log,
                 lr_log,
                 timing_log,
@@ -600,6 +687,7 @@ def main_function(experiment_directory, continue_from, batch_split):
 
 if __name__ == "__main__":
     import argparse
+    torch.cuda.empty_cache()
 
     arg_parser = argparse.ArgumentParser(description="Train a DeepLS autodecoder")
     arg_parser.add_argument(
@@ -628,11 +716,27 @@ if __name__ == "__main__":
              + "subbatches. This allows for training with large effective batch "
              + "sizes in memory constrained environments.",
     )
-
+    arg_parser.add_argument(
+        "--cluster",
+        dest="cluster",
+        default=False,
+        action="store_true",
+        help="If set, training on cluster will be enabled",
+    )
+    wandb.login(key="845cb3b94791a8d541b28fd3a9b2887374fe8b2c")
+    wandb.init(project="Training DeepLS")
     deep_ls.add_common_args(arg_parser)
 
     args = arg_parser.parse_args()
 
     deep_ls.configure_logging(args)
 
-    main_function(args.experiment_directory, args.continue_from, int(args.batch_split))
+    if (args.cluster):
+        from polyaxon_client.tracking import Experiment, get_data_paths, get_outputs_path
+        output_directory = get_outputs_path()
+        logging.debug("Output paths from polyaxon: " + str(output_directory))
+
+    else:
+        output_directory = args.experiment_directory
+
+    main_function(args.experiment_directory,output_directory,args.continue_from, int(args.batch_split),args.cluster)

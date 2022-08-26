@@ -14,6 +14,8 @@ import deep_ls.workspace as ws
 
 
 def get_instance_filenames(data_source, split):
+    logging.debug("Hello from get_instance filenames")
+
     npzfiles = []
     for dataset in split:
         for class_name in split[dataset]:
@@ -24,12 +26,16 @@ def get_instance_filenames(data_source, split):
                 if not os.path.isfile(
                         os.path.join(data_source, ws.sdf_samples_subdir, instance_filename)
                 ):
+
                     # raise RuntimeError(
                     #     'Requested non-existent file "' + instance_filename + "'"
                     # )
                     logging.warning(
                         "Requested non-existent file '{}'".format(instance_filename)
                     )
+                #else:
+                    #logging.debug("Current filename: {}".format(os.path.join(data_source, ws.sdf_samples_subdir, instance_filename)))
+
                 npzfiles += [instance_filename]
     return npzfiles
 
@@ -148,6 +154,7 @@ class SDFSamples(torch.utils.data.Dataset):
             + " shapes from data source "
             + data_source
         )
+
 
         self.load_ram = load_ram
 

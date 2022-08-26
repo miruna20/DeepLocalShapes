@@ -59,6 +59,8 @@ def create_mesh(decoder, latent_vec, cube_size, box_size, filename, N=128, max_b
     sdf_tree_second = KDTree(tree_samples_second, metric="chebyshev", leaf_size=100)
     logging.debug("Took {} seconds.".format(time.time() - tree_start))
 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     sdf_grid_indices = deep_ls.data.generate_grid_center_indices(cube_size=cube_size, box_size=box_size)
     for center_point_index in tqdm(range(len(sdf_grid_indices))):
         near_sample_indices = sdf_tree_first.query_radius([sdf_grid_indices[center_point_index]], grid_radius)
@@ -68,11 +70,11 @@ def create_mesh(decoder, latent_vec, cube_size, box_size, filename, N=128, max_b
         near_sample_indices = near_sample_indices[0]
         near_sample_indices_two = sdf_tree_second.query_radius([sdf_grid_indices[center_point_index]], grid_radius)
         near_sample_indices = np.append(near_sample_indices, near_sample_indices_two[0])
-        code = latent_vec[center_point_index].cuda()
+        code = latent_vec[center_point_index].to(device)
         transformed_sample = samples[near_sample_indices, 0:3] - sdf_grid_indices[center_point_index] 
         code = code.expand(1, 125)
         code = code.repeat(transformed_sample.shape[0], 1)
-        decoder_input = torch.cat([code, transformed_sample.cuda()], dim=1).float().cuda()
+        decoder_input = torch.cat([code, transformed_sample.to(device)], dim=1).float().to(device)
         samples[near_sample_indices, 3] = decoder(decoder_input).squeeze(1).detach().cpu()
         samples_counter[near_sample_indices, 0] += 1
     
@@ -116,8 +118,8 @@ def convert_sdf_samples_to_ply(
 
     numpy_3d_sdf_tensor = pytorch_3d_sdf_tensor.numpy()
 
-    verts, faces, normals, values = skimage.measure.marching_cubes_lewiner(
-        numpy_3d_sdf_tensor, level=0.0, spacing=[voxel_size] * 3
+    verts, faces, normals, values = skimage.measure.marching_cubes(
+        numpy_3d_sdf_tensor, level=0.0, spacing=[voxel_size] * 3,method='lewiner'
     )
 
     # transform from voxel coordinates to camera coordinates

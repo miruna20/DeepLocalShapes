@@ -12,6 +12,8 @@ import torch
 
 import deep_ls
 import deep_ls.workspace as ws
+import wandb
+
 
 from train_deep_ls import get_spec_with_default
 
@@ -43,11 +45,12 @@ def reconstruct(
 
     sdf_grid_indices = deep_ls.data.generate_grid_center_indices(cube_size=cube_size, box_size=box_size)
     sdf_grid_radius = voxel_radius * ((box_size * 2) / cube_size)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     if type(stat) == type(0.1):
-        latent = torch.ones(len(sdf_grid_indices), latent_size).normal_(mean=0, std=stat).cuda()
+        latent = torch.ones(len(sdf_grid_indices), latent_size).normal_(mean=0, std=stat).to(device)
     else:
-        latent = torch.normal(stat[0].detach(), stat[1].detach()).cuda()
+        latent = torch.normal(stat[0].detach(), stat[1].detach()).to(device)
         raise NotImplementedError # TODO
 
     latent.requires_grad = True
@@ -73,16 +76,16 @@ def reconstruct(
             num_sdf_samples = len(near_sample_indices[0])
             if num_sdf_samples < 1: 
                 continue
-            code = latent[center_point_index].cuda()
+            code = latent[center_point_index].to(device)
             sdf_gt = sdf_data[near_sample_indices[0], 3].unsqueeze(1)
             sdf_gt = torch.tanh(sdf_gt)
             transformed_sample = sdf_data[near_sample_indices[0], :3] - sdf_grid_indices[center_point_index] 
             transformed_sample.requires_grad = False
             code = code.expand(1, 125)
             code = code.repeat(transformed_sample.shape[0], 1)
-            decoder_input = torch.cat([code, transformed_sample.cuda()], dim=1).float().cuda()
+            decoder_input = torch.cat([code, transformed_sample.to(device)], dim=1).float().to(device)
             pred_sdf = decoder(decoder_input)
-            loss += loss_l1(pred_sdf, sdf_gt.cuda()) / len(sdf_grid_indices)
+            loss += loss_l1(pred_sdf, sdf_gt.to(device)) / len(sdf_grid_indices)
         if l2reg:
             loss += 1e-4 * torch.mean(latent.pow(2))
         loss.backward()
@@ -92,6 +95,8 @@ def reconstruct(
             logging.debug(loss.cpu().data.numpy())
             logging.debug(e)
             logging.debug(latent.norm())
+            wandb.log({"loss_reconstruction": loss.cpu().data.numpy().item()})
+
         loss_num = loss.cpu().data.numpy()
 
     return loss_num, latent
@@ -145,6 +150,22 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip meshes which have already been reconstructed.",
     )
+    arg_parser.add_argument(
+        "--cluster",
+        dest="cluster",
+        default=False,
+        action="store_true",
+        help="If set, training on cluster will be enabled",
+    )
+
+    print("Reconstructing chairs...")
+
+    wandb.login(key="845cb3b94791a8d541b28fd3a9b2887374fe8b2c")
+    wandb.init(project="Reconstruction")
+
+    print("Initialization of wandb successfull")
+
+
     deep_ls.add_common_args(arg_parser)
 
     args = arg_parser.parse_args()
@@ -152,7 +173,9 @@ if __name__ == "__main__":
     deep_ls.configure_logging(args)
 
     def empirical_stat(latent_vecs, indices):
-        lat_mat = torch.zeros(0).cuda()
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        lat_mat = torch.zeros(0).to(device)
         for ind in indices:
             lat_mat = torch.cat([lat_mat, latent_vecs[ind]], 0)
         mean = torch.mean(lat_mat, 0)
@@ -176,6 +199,7 @@ if __name__ == "__main__":
     voxel_radius = specs["VoxelRadius"]
 
     decoder = arch.Decoder(latent_size, **specs["NetworkSpecs"])
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     if torch.cuda.device_count() > 1:
         decoder = torch.nn.DataParallel(decoder)
@@ -183,19 +207,29 @@ if __name__ == "__main__":
     saved_model_state = torch.load(
         os.path.join(
             args.experiment_directory, ws.model_params_subdir, args.checkpoint + ".pth"
-        )
+        ),map_location=device
     )
     saved_model_epoch = saved_model_state["epoch"]
 
     decoder.load_state_dict(saved_model_state["model_state_dict"])
 
     if torch.cuda.device_count() > 1:
-        decoder = decoder.module.cuda()
+        decoder = decoder.module.to(device)
     else:
-        decoder = decoder.cuda()
+        decoder = decoder.to(device)
 
     with open(args.split_filename, "r") as f:
         split = json.load(f)
+
+    if (args.cluster):
+        from polyaxon_client.tracking import Experiment, get_data_paths, get_outputs_path
+
+        data_paths_polyaxon = get_data_paths()
+        data_source = os.path.join(data_paths_polyaxon['data1'], "USShapeCompletion", args.data_source)
+        output_directory = get_outputs_path()
+    else:
+        data_source = args.data_source
+        output_directory = args.experiment_directory
 
     npz_filenames = deep_ls.data.get_instance_filenames(args.data_source, split)
 
@@ -209,7 +243,7 @@ if __name__ == "__main__":
     rerun = 0
 
     reconstruction_dir = os.path.join(
-        args.experiment_directory, ws.reconstructions_subdir, str(saved_model_epoch)
+        output_directory, ws.reconstructions_subdir, str(saved_model_epoch)
     )
 
     if not os.path.isdir(reconstruction_dir):
@@ -232,7 +266,7 @@ if __name__ == "__main__":
         if "npz" not in npz:
             continue
 
-        full_filename = os.path.join(args.data_source, ws.sdf_samples_subdir, npz)
+        full_filename = os.path.join(data_source, ws.sdf_samples_subdir, npz)
 
         logging.debug("loading {}".format(npz))
 
